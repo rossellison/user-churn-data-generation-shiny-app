@@ -1,0 +1,217 @@
+---
+title: "making models"
+output: html_document
+date: "2023-04-07"
+---
+
+```{r}
+# Load required libraries
+library(tidymodels)
+
+# Split the dataset into a training set (90%) and a test set (10%)
+users_test = 1000
+df_test <- tibble(
+  user_id = map_chr(1:users_test, ~generate_uuid()))%>%
+  mutate(total_logins = generate_total_logins_gamma(n()),
+  feature_a_time_spent = generate_time_spent_on_feature_a(n()),
+  feature_b_time_spent = generate_time_spent_on_feature_b(n(), total_logins, avg_session_length),
+  feature_c_time_spent = generate_time_spent_on_feature_c(n(), total_logins, avg_session_length),
+  feature_d_time_spent = generate_time_spent_on_feature_d(n(), total_logins, avg_session_length),
+  highest_consecutive_weekly_login_streak = generate_highest_consecutive_weekly_login_streak(n(), feature_a_time_spent, feature_d_time_spent, total_logins))%>%
+  rowwise() %>%
+  mutate(renewal_decision = generate_subscription_renewal(feature_a_time_spent, feature_b_time_spent, feature_c_time_spent, feature_d_time_spent, total_logins, highest_consecutive_weekly_login_streak))
+
+# Fit the logistic regression model
+logistic_model <- glm(renewal_decision ~ total_logins + feature_a_time_spent + feature_b_time_spent + feature_c_time_spent + feature_d_time_spent + highest_consecutive_weekly_login_streak, 
+                      data = df, family = binomial(link = "logit"))
+
+# Make predictions on the test data
+df_test_log=df_test
+df_test_log$predicted_renewal_prob <- predict(logistic_model, newdata = df_test_log, type = "response")
+
+# Set a threshold for the predicted renewal (e.g., 0.5)
+df_test_log$predicted_renewal <- ifelse(df_test_log$predicted_renewal_prob > 0.5, 1, 0)
+
+# Calculate model accuracy
+log_accuracy <- mean(df_test_log$predicted_renewal == df_test_log$renewal_decision)
+print(paste("Model accuracy:", log_accuracy))
+```
+lets inspect the model
+```{r}
+library(ggplot2)
+library(coefplot)
+coefplot(logistic_model, intercept = FALSE, title = "Coefficient plot for logistic regression model")
+
+```
+
+```{r}
+library(broom)
+tidy_logistic_model <- tidy(logistic_model)
+tidy_logistic_model
+```
+let's look at random forest &
+find the best random forest parameters
+```{r}
+# Load the necessary libraries
+library(randomForest)
+library(ggplot2)
+
+# Convert the renewal_decision variable to a factor in both the training and testing datasets
+df$renewal_decision <- as.factor(df$renewal_decision)
+df_test$renewal_decision <- as.factor(df_test$renewal_decision)
+
+# Define the parameter values to test
+ntree_values <- c(150, 185, 200, 225, 250)
+mtry_values <- c(2, 3)
+
+# Initialize variables to store the best model and accuracy
+best_model <- NULL
+best_accuracy <- 0
+
+# Loop through all combinations of ntree and mtry
+for (ntree in ntree_values) {
+  for (mtry in mtry_values) {
+    # Train the random forest model with the current parameters
+    model <- randomForest(renewal_decision ~ . - user_id, data = df, ntree = ntree, mtry = mtry)
+    
+    # Make predictions on the test data
+    predictions <- predict(model, df_test)
+    
+    # Calculate accuracy
+    accuracy <- mean(predictions == df_test$renewal_decision)
+    
+    # Update the best model and accuracy if the current accuracy is higher
+    if (accuracy > best_accuracy) {
+      best_model <- model
+      best_accuracy <- accuracy
+    }
+  }
+}
+random_forest_df = df_test
+random_forest_df$randomforestpreds = predictions
+best_randomForest_model <- best_model
+best_randomForest_accuracy <- best_accuracy
+# Print the best model and accuracy
+
+# Visualize the feature importance
+importance_df <- data.frame(
+  Feature = rownames(best_randomForest_model$importance),
+  Importance = best_randomForest_model$importance[, "MeanDecreaseGini"]
+)
+importance_df <- importance_df[order(importance_df$Importance, decreasing = TRUE), ]
+
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  xlab("Feature") +
+  ylab("Importance") +
+  ggtitle("Feature Importance")
+
+```
+lets go all out best predictions
+
+```{r}
+library(torch)
+library(dplyr)
+
+#Preprocess the data
+train_data <- df %>%
+select(-user_id) %>%
+mutate(across(everything(), as.numeric))
+
+test_data <- df_test %>%
+select(-user_id) %>%
+mutate(across(everything(), as.numeric))
+
+train_mean <- apply(train_data[, -ncol(train_data)], 2, mean)
+train_std <- apply(train_data[, -ncol(train_data)], 2, sd)
+train_data[, -ncol(train_data)] <- scale(train_data[, -ncol(train_data)], center = train_mean, scale = train_std)
+
+for (i in 1:(ncol(test_data) - 1)) {
+test_data[, i] <- scale(test_data[, i], center = train_mean[i], scale = train_std[i])
+}
+
+
+x_train <- torch_tensor(train_data[, -ncol(train_data)] %>% as.matrix())
+y_train <- torch_tensor(as.numeric(unlist(train_data[, ncol(train_data)]))+1)$to(dtype = torch_long())
+
+x_test <- torch_tensor(test_data[, -ncol(test_data)] %>% as.matrix())
+y_test <- torch_tensor(as.numeric(unlist(test_data[, ncol(test_data)]))+1)$to(dtype = torch_long())
+
+net <- nn_module(
+"Classifier",
+initialize = function(input_size, hidden_size, output_size) {
+self$fc1 <- nn_linear(input_size, hidden_size)
+self$fc2 <- nn_linear(hidden_size, output_size)
+},
+forward = function(x) {
+x <- self$fc1(x)
+x <- nnf_relu(x)
+x <- self$fc2(x)
+x
+}
+)
+
+input_size <- ncol(x_train)
+hidden_size <- 128
+output_size <- 2
+learning_rate <- 0.01
+num_epochs <- 100
+
+torch_model <- net(input_size, hidden_size, output_size)
+criterion <- nn_cross_entropy_loss()
+optimizer <- optim_sgd(torch_model$parameters, lr = learning_rate)
+
+for (epoch in 1:num_epochs) {
+  output <- torch_model(x_train)
+  loss <- criterion(output, y_train)
+  
+  optimizer$zero_grad()
+  loss$backward()
+  optimizer$step()
+  
+  cat("Epoch:", epoch, "Loss:", as.numeric(loss), "\n")
+}
+
+test_output <- torch_model(x_test)
+predicted_labels <- test_output$argmax(dim = 2)
+torch_accuracy <- (predicted_labels == y_test)$sum() / y_test$size(1)
+cat("torch Accuracy:", as.numeric(torch_accuracy), "\n")
+torch_df = df_test
+torch_df$torch_predictions <- as.numeric(as_array(predicted_labels - 1))
+
+
+```
+learning about torch model
+```{r}
+# Extract the weights from the model
+weights_fc1 <- model$fc1$weight
+weights_fc2 <- model$fc2$weight
+#weights_fc3 <- model$fc3$weight
+
+# Plot the weights as heatmaps or histograms
+library(ggplot2)
+
+# Function to plot the heatmap of weights
+# Function to plot the heatmap of weights
+# Function to plot the heatmap of weights
+# Function to plot the heatmap of weights
+plot_heatmap <- function(weights, layer_name) {
+  weights_array <- as.array(weights)
+  weights_matrix <- matrix(weights_array, ncol = ncol(weights_array))
+  df <- as.data.frame(weights_matrix)
+  df$y <- 1:nrow(df)
+  df <- tidyr::gather(df, x, value, -y)
+  df$x <- as.numeric(gsub("V", "", df$x))
+  
+  ggplot(df, aes(x = x, y = y, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+    labs(title = paste("Weights Heatmap -", layer_name), x = "Neurons", y = "Features") +
+    theme_minimal()
+}
+
+plot_heatmap(weights_fc1, "Layer 1")
+plot_heatmap(weights_fc2, "Layer 2")
+
+```
